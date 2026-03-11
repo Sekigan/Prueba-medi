@@ -208,33 +208,36 @@ class OrderRequest(BaseModel):
 
 
 @app.post("/orders/")
-def create_order(order_data: OrderRequest, db: Session = Depends(db.get_db)):
-    """
-    Crear una orden con:
-    - Verificación de stock
-    - Creación de orden y items
-    - Actualización de stock
-    - Registro de movimientos
-    - Asignación de estado (confirmed/rejected)
-    """
-    
-    # 1. VERIFICAR CLIENTE
-    customer = customer_entity.get_customer(db, order_data.customer)
+def create_order(order: OrderRequest, db: Session = Depends(db.get_db)):
+    """Crear nueva orden"""
+    # Verificar cliente
+    customer = customer_entity.get_customer(db, order.customer)
     if not customer:
-        raise HTTPException(404, f"Cliente {order_data.customer} no encontrado")
+        raise HTTPException(404, f"Cliente {order.customer} no encontrado")
     
-    # 2. VERIFICAR PRODUCTOS Y STOCK
-    products_info = []
+    # Verificar productos y stock
+    items_to_create = []
+    total = 0
     all_sufficient = True
     insufficient_products = []
-    
-    for item in order_data.products:
+# Antes de cualquier operación, define:
+    products_info = []          # Para guardar info de productos
+    items_created = []          # Para items de orden
+    movements_created = []      # Para movimientos
+
+    for item in order.products:
+        product = product_entity.get_product(db, item.product_id)
+        if not product:
+            raise HTTPException(404, f"Producto {item.product_id} no encontrado")
+
+    # 3. VERIFICAR PRODUCTOS
+    for item in order.products:
         product = product_entity.get_product(db, item.product_id)
         if not product:
             raise HTTPException(404, f"Producto {item.product_id} no encontrado")
         
-        # Verificar stock
         sufficient = product.stock >= item.quantity
+        
         if not sufficient:
             all_sufficient = False
             insufficient_products.append({
@@ -250,31 +253,32 @@ def create_order(order_data: OrderRequest, db: Session = Depends(db.get_db)):
             "sufficient": sufficient
         })
     
-    # 3. DETERMINAR ESTADO DE LA ORDEN
+    # 4. DETERMINAR ESTADO
     order_status = "confirmed" if all_sufficient else "rejected"
     
-    # 4. CREAR LA ORDEN
+    # 5. CREAR ORDEN EN BD
     db_order = models.Order(
-        customer_id=order_data.customer,
+        customer_id=order.customer,  # ✅ USANDO 'order'
         status=order_status,
         total=0
     )
     db.add(db_order)
-    db.flush()  # Para obtener order_id
+    db.flush()
     
     total = 0
     items_created = []
     movements_created = []
     
-    # 5. PROCESAR CADA PRODUCTO
+    # 6. PROCESAR PRODUCTOS
     for info in products_info:
         product = info["product"]
         quantity = info["quantity"]
+        sufficient = info["sufficient"]
         
         # Guardar stock anterior
         old_stock = product.stock
         
-        # 5.1 Crear order item (SIEMPRE se crea, incluso si es rechazada)
+        # Crear order item (siempre)
         db_item = models.Order_item(
             order_id=db_order.order_id,
             product_id=product.product_id,
@@ -284,12 +288,12 @@ def create_order(order_data: OrderRequest, db: Session = Depends(db.get_db)):
         db.add(db_item)
         items_created.append(db_item)
         
-        # 5.2 SOLO SI HAY STOCK SUFICIENTE: actualizar stock y registrar movimiento
-        if info["sufficient"]:
+        # Si hay stock suficiente
+        if sufficient:
             # Actualizar stock
             product.stock -= quantity
             
-            # Registrar movimiento de inventario
+            # Registrar movimiento
             db_movement = models.Inventory_movement(
                 product_id=product.product_id,
                 movement_type="salida",
@@ -301,26 +305,19 @@ def create_order(order_data: OrderRequest, db: Session = Depends(db.get_db)):
             )
             db.add(db_movement)
             movements_created.append(db_movement)
-        
-        # Calcular subtotal para el total de la orden
-        total += product.price * quantity
+            
+            # Sumar al total
+            total += product.price * quantity
     
-    # 6. ACTUALIZAR TOTAL DE LA ORDEN
+    # 7. ACTUALIZAR TOTAL
     db_order.total = total
     
-    # 7. GUARDAR TODO EN BASE DE DATOS
+    # 8. GUARDAR TODO
     db.commit()
-    
-    # 8. REFRESCAR PARA OBTENER IDs
-    db.refresh(db_order)
-    for item in items_created:
-        db.refresh(item)
-    for movement in movements_created:
-        db.refresh(movement)
     
     # 9. PREPARAR RESPUESTA
     response = {
-        "message": f"Orden creada exitosamente - Estado: {order_status}",
+        "message": f"Orden creada - Estado: {order_status}",
         "order": {
             "order_id": db_order.order_id,
             "customer": {
@@ -328,39 +325,45 @@ def create_order(order_data: OrderRequest, db: Session = Depends(db.get_db)):
                 "name": customer.name,
                 "email": customer.email
             },
-            "date": db_order.order_date,
+            "date": db_order.order_date.isoformat() if db_order.order_date else None,
             "status": db_order.status,
             "total": float(db_order.total)
         },
-        "products": [],
-        "inventory_movements": []
+        "products": []
     }
     
     # Agregar productos a la respuesta
     for info in products_info:
         product = info["product"]
         quantity = info["quantity"]
+        sufficient = info["sufficient"]
+        
+        price_float = float(product.price)
+        subtotal = price_float * quantity
+        
         response["products"].append({
             "product_id": product.product_id,
             "name": product.name,
             "quantity": quantity,
-            "price": float(product.price),
-            "subtotal": float(product.price * quantity),
-            "stock_available": info["sufficient"]
+            "price": price_float,
+            "subtotal": subtotal if sufficient else 0,
+            "condition_met": sufficient
         })
     
-    # Agregar movimientos a la respuesta (solo si hubo)
-    for movement in movements_created:
-        response["inventory_movements"].append({
-            "movement_id": movement.movement_id,
-            "product_id": movement.product_id,
-            "type": movement.movement_type,
-            "quantity": movement.quantity,
-            "previous_stock": movement.previous_stock,
-            "new_stock": movement.new_stock
-        })
+    # Agregar movimientos
+    if movements_created:
+        response["inventory_movements"] = []
+        for movement in movements_created:
+            response["inventory_movements"].append({
+                "movement_id": movement.movement_id,
+                "product_id": movement.product_id,
+                "type": movement.movement_type,
+                "quantity": movement.quantity,
+                "previous_stock": movement.previous_stock,
+                "new_stock": movement.new_stock
+            })
     
-    # Si hay productos sin stock, agregar advertencia
+    # Agregar advertencia
     if insufficient_products:
         response["warning"] = {
             "message": "Algunos productos no tenían stock suficiente",
@@ -369,14 +372,14 @@ def create_order(order_data: OrderRequest, db: Session = Depends(db.get_db)):
     
     return response
 
-#OBTENER TODAS LAS ORDERS
+
+
+
+
+# LISTAR TODAS LAS ORDENES
 @app.get("/orders/")
-def get_orders(db: Session = Depends(db.get_db)):
-    orders = db.query(models.Order).all()
-    return orders
-
-
-
+def get_all_orders(db: Session = Depends(db.get_db)):
+    return order_entity.get_orders(db)
 
 # OBTENER ORDEN POR ID
 @app.get("/orders/{id}")
@@ -398,85 +401,6 @@ def update_status(id: int, status: str, db: Session = Depends(db.get_db)):
 @app.get("/orders/customer/{customer_id}")
 def customer_orders(customer_id: int, db: Session = Depends(db.get_db)): 
     return order_entity.get_customer_orders(db, customer_id)
-
-
-class OrderStatusUpdate(BaseModel):
-    """Modelo para actualizar el estado de una orden"""
-    status: str
-    notes: Optional[str] = None
-
-
-@app.patch("/orders/{order_id}/status")
-def update_order_status(
-    order_id: int,
-    status_update: OrderStatusUpdate,
-    db: Session = Depends(db.get_db)
-):
-    """
-    Actualizar el estado de una orden
-    
-    Estados válidos: pending, confirmed, rejected, delivered
-    
-    Ejemplo de body:
-    {
-        "status": "confirmed",
-        "notes": "Orden confirmada por el sistema"
-    }
-    """
-    try:
-        # Validar que la orden existe
-        order = order_entity.get_order(db, order_id)
-        if not order:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Orden {order_id} no encontrada"
-            )
-        
-        # Guardar estado anterior para el mensaje
-        old_status = order.status
-        
-        # Actualizar estado
-        updated_order = order_entity.update_order_status(
-            db, 
-            order_id, 
-            status_update.status
-        )
-        
-        if not updated_order:
-            raise HTTPException(
-                status_code=404,
-                detail=f"No se pudo actualizar la orden {order_id}"
-            )
-        
-        # Preparar respuesta
-        response = {
-            "message": f"Estado de orden actualizado: {old_status} → {status_update.status}",
-            "order_id": order_id,
-            "old_status": old_status,
-            "new_status": status_update.status,
-            "order": {
-                "order_id": updated_order.order_id,
-                "customer_id": updated_order.customer_id,
-                "status": updated_order.status,
-                "total": float(updated_order.total),
-                "order_date": updated_order.order_date.isoformat() if updated_order.order_date else None
-            }
-        }
-        
-        # Agregar notas si se proporcionaron
-        if status_update.notes:
-            response["notes"] = status_update.notes
-        
-        return response
-        
-    except ValueError as e:
-        # Error por estado inválido
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error al actualizar: {str(e)}")
-
-
-
 
 
 #INVENTORY_MOVEMENT
